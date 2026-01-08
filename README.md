@@ -13,3 +13,6 @@ Install ```Python 3 for Unraid``` and ```user scripts``` from the community app 
 Add contents from ```pip installs``` to a new script and set that to run on ```at Startup of Array```
 
 Add contents of ```NPMAccessList.py``` to a new script and set that to run on what ever schedule you would like
+
+Disclaimer:
+Im not a python expert, this was just vibe coded with Gemini for personal use.
