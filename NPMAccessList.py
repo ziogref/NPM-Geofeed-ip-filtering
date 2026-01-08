@@ -26,15 +26,16 @@ ISP_SOURCES = [
     ("Telstra.TAS", "https://geofeed.tools.telstra.net/geofeed.csv", "AU", "AU-TAS"),
     ("Telstra.VIC", "https://geofeed.tools.telstra.net/geofeed.csv", "AU", "AU-VIC"), 
     ("AussieBroadBand", "https://speed.aussiebroadband.com.au/abb-geo.csv", "AU", "AU-VIC"),
-    ("Vocus.Dodo.Iprimus", "https://geofeed.tools.telstra.net/geofeed.csv", "AU", "AU-TAS"),
     ("Leaptel.TAS", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU-TAS"),
+    ("Flip Connect", "	https://flipconnect.com.au/api/csv/flip-au-geo-feed-20240626.csv", "AU", "AU-VIC"),
     ("Leaptel.QLD", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU- QLD"),
     # To do list
-    # Check Vocus, Dodo and iPrimus use Telstra geofeed data
+
     # Optus
-    # Flip Internet (Angela Walker)
     # Launtel CGNAT ipranges
 
+    
+    # ("Vocus.Dodo.Iprimus", "https://nettools.vocus.network/vocus-geo-feed.csv", "AU", "AU-TAS"), # Currently no one using Vocus based ISP
 ]
 
 # Google IP Ranges URL (JSON format)
