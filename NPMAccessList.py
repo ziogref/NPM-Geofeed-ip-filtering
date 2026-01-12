@@ -8,14 +8,16 @@ import logging
 import ipaddress
 import sys
 import os
-import re  # Added for error string parsing
+import re
+import socket
+import concurrent.futures
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 
 # Path to your secrets file
-CONFIG_FILE = "/boot/config/npm_secrets.json" 
+CONFIG_FILE = "/boot/config/npm_cache/npm_secrets.json" 
 
 # Directory to store cached geofeed files (Persistent on Unraid)
 CACHE_DIR = "/boot/config/npm_cache"
@@ -26,7 +28,7 @@ ACCESS_LIST_NAME = "Allowed_ISPs"
 # Enable NTFY Notifications (True/False)
 ENABLE_NTFY = True
 
-# Your Source List (CSV based sources)
+# --- EXISTING GEOFEED SOURCES ---
 # Format: ("Name", "URL", "CountryCode", "RegionCode")
 ISP_SOURCES = [
     ("Launtel", "https://residential.launtel.net.au/geofeed.csv", "AU", "AU-TAS"),
@@ -37,6 +39,22 @@ ISP_SOURCES = [
     ("Flip Connect", "https://flipconnect.com.au/api/csv/flip-au-geo-feed-20240626.csv", "AU", "AU-VIC"),
     ("Leaptel.QLD", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU-QLD"),
 ]
+
+# --- NEW SCANNING RULES (From test4.py) ---
+# Format: ("ASN", "TAG_NAME", r"REGEX_PATTERN")
+# Note: These scan live Gateways. It may take time to run.
+SEARCH_RULES = [
+    # --- AS4804 (Optus Retail/Backbone) ---
+    ("AS4804", "Optus.VIC_Mobile", r"pa\.vic|pa-vic"),
+    ("AS4804", "Optus.TAS_General", r"(\.|-)tas(\.|-)|hobart|launceston"),
+    
+    # --- AS7474 (Optus Wholesale/Business) ---
+    ("AS7474", "OptusBiz.VIC_Mobile", r"pa\.vic|pa-vic"),
+    ("AS7474", "OptusBiz.TAS_General", r"(\.|-)tas(\.|-)|hobart|launceston"),
+]
+
+SCANNER_THREADS = 20   # Increased slightly for faster scanning
+SCANNER_TIMEOUT = 2.0  # Timeout for DNS lookups
 
 # Google IP Ranges URL (JSON format)
 GOOGLE_IP_URL = "https://www.gstatic.com/ipranges/goog.json"
@@ -70,13 +88,12 @@ def send_ntfy_msg(ntfy_config, message, title):
         url = f"{ntfy_config['url']}/{ntfy_config['topic']}"
         headers = {
             "Title": f"NPM | {title}",
-            "Tags": "warning"  # 'warning' tag applied to ALL messages
+            "Tags": "warning"
         }
         
         if ntfy_config.get('token'):
             headers["Authorization"] = f"Bearer {ntfy_config['token']}"
         
-        # logger.info(f"Sending NTFY: {title}")
         resp = requests.post(url, data=message.encode('utf-8'), headers=headers)
         if resp.status_code != 200:
             logger.warning(f"NTFY failed. Code: {resp.status_code}, Resp: {resp.text}")
@@ -89,76 +106,101 @@ def get_content_with_fallback(name, url, ntfy_config=None):
     If successful -> saves to cache -> returns content.
     If failed -> sends NTFY -> loads from cache -> returns content.
     """
-    # Ensure cache directory exists
     if not os.path.exists(CACHE_DIR):
         try:
             os.makedirs(CACHE_DIR)
         except OSError as e:
             logger.error(f"Could not create cache directory {CACHE_DIR}: {e}")
 
-    # Create a safe filename
     safe_name = "".join([c for c in name if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).strip().replace(" ", "_")
     cache_path = os.path.join(CACHE_DIR, f"{safe_name}.cache")
 
     try:
-        # Attempt Download
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
-        
         content = response.text
         
-        # Save to cache
         with open(cache_path, 'w', encoding='utf-8') as f:
             f.write(content)
-            
         return content
 
     except Exception as e:
         raw_error = str(e)
         logger.error(f"Failed to fetch {name}: {raw_error}")
         
-        # --- Simplify Error Message for NTFY ---
-        clean_error = "Connection Failed" # Default
+        clean_error = "Connection Failed"
+        if "Name or service not known" in raw_error: clean_error = "DNS Error"
+        elif "404" in raw_error: clean_error = "HTTP 404"
+        elif "500" in raw_error: clean_error = "HTTP 500"
         
-        # Check for DNS Resolution errors
-        # Matches: "Failed to resolve 'hostname'" inside the messy exception text
-        dns_match = re.search(r"Failed to resolve '([^']+)'", raw_error)
-        
-        if dns_match:
-            clean_error = f"Failed to resolve {dns_match.group(1)}"
-        elif "Name or service not known" in raw_error:
-            clean_error = "DNS Error: Name unknown"
-        elif "404" in raw_error:
-            clean_error = "HTTP 404 (Not Found)"
-        elif "500" in raw_error:
-            clean_error = "HTTP 500 (Server Error)"
-        elif "502" in raw_error or "503" in raw_error:
-            clean_error = "HTTP Server Error"
-        elif "ConnectTimeout" in raw_error:
-            clean_error = "Connection Timeout"
-        elif "Connection refused" in raw_error:
-             clean_error = "Connection Refused"
-        
-        # Notify about the failure
         if ntfy_config:
-            ntfy_msg = f"{name} | {clean_error} | Using last known geofeed file"
-            send_ntfy_msg(ntfy_config, ntfy_msg, title="Geofeed Download Failed")
+            ntfy_msg = f"{name} | {clean_error} | Using last known data"
+            send_ntfy_msg(ntfy_config, ntfy_msg, title="Download Failed")
 
-        # Fallback to cache
         if os.path.exists(cache_path):
             logger.warning(f"Falling back to cached file for {name}...")
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     return f.read()
-            except Exception as cache_e:
-                logger.error(f"Failed to read cache for {name}: {cache_e}")
+            except Exception:
                 return None
         else:
-            logger.error(f"No cached file found for {name}. Skipping source.")
             return None
 
 # ==========================================
-# LOGIC
+# SCANNER LOGIC (From test4.py)
+# ==========================================
+
+def fetch_ripe_data(asn, ntfy_config=None):
+    """Fetches prefixes for an ASN using RIPE API (With caching)."""
+    url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource={asn}"
+    # We use the existing fallback downloader so we don't spam RIPE if they go down
+    content = get_content_with_fallback(f"RIPE_{asn}", url, ntfy_config)
+    
+    if not content:
+        return []
+
+    try:
+        data = json.loads(content)
+        prefixes = []
+        if 'data' in data and 'prefixes' in data['data']:
+            for item in data['data']['prefixes']:
+                prefix = item['prefix']
+                if ":" not in prefix: # IPv4 Only for now
+                    prefixes.append(prefix)
+        return prefixes
+    except Exception as e:
+        logger.error(f"Error parsing RIPE data for {asn}: {e}")
+        return []
+
+def scan_cidr_for_hostname(cidr, rules_for_this_asn):
+    """
+    Worker function: Checks the gateway of a CIDR against regex rules.
+    """
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+        
+        # Determine Gateway IP (First Usable)
+        if network.num_addresses > 1:
+            gateway_ip = network.network_address + 1
+        else:
+            gateway_ip = network.network_address
+
+        # Reverse DNS Lookup
+        hostname, _, _ = socket.gethostbyaddr(str(gateway_ip))
+        hostname_str = str(hostname).lower()
+
+        # Check against the rules configured for THIS ASN
+        for tag, pattern in rules_for_this_asn:
+            if re.search(pattern, hostname_str, re.IGNORECASE):
+                return (cidr, tag, hostname_str)
+        
+        return None
+    except Exception:
+        return None
+
+# ==========================================
+# NPM LOGIC
 # ==========================================
 
 class NpmManager:
@@ -177,8 +219,7 @@ class NpmManager:
                 "secret": self.password
             })
             response.raise_for_status()
-            data = response.json()
-            self.token = data['token']
+            self.token = response.json()['token']
             logger.info("Successfully authenticated with Nginx Proxy Manager.")
         except Exception as e:
             logger.error(f"Failed to login to NPM: {e}")
@@ -191,9 +232,7 @@ class NpmManager:
         endpoint = f"{self.url}/api/nginx/access-lists"
         response = self.session.get(endpoint, headers=self.get_headers())
         response.raise_for_status()
-        lists = response.json()
-        
-        for item in lists:
+        for item in response.json():
             if item['name'] == name:
                 return item['id'], item
         return None, None
@@ -201,17 +240,15 @@ class NpmManager:
     def update_access_list(self, name, ips, source_map=None, ntfy_config=None):
         list_id, existing_data = self.get_access_list_id(name)
         
-        # --- CHECK FOR CHANGES BEFORE UPDATING ---
         if list_id:
             try:
+                # Check for changes
                 endpoint = f"{self.url}/api/nginx/access-lists/{list_id}"
                 resp = self.session.get(endpoint, headers=self.get_headers(), params={"expand": "clients"})
                 resp.raise_for_status()
                 full_data = resp.json()
                 
                 raw_clients = full_data.get('clients', [])
-                logger.info(f"Existing Access List ID {list_id} found. Fetched {len(raw_clients)} existing clients.")
-
                 current_ips = set()
                 for c in raw_clients:
                     try:
@@ -229,52 +266,22 @@ class NpmManager:
                 added = new_ips - current_ips
                 removed = current_ips - new_ips
                 
-                logger.info(f"CHANGES DETECTED: {len(added)} IPs to add, {len(removed)} IPs to remove.")
+                logger.info(f"CHANGES: {len(added)} to add, {len(removed)} to remove.")
 
-                if added:
-                    logger.info("--- IPs Identifying for ADDITION ---")
-                    for ip in sorted(added):
-                        src = source_map.get(ip, 'Unknown') if source_map else 'Unknown'
-                        logger.info(f" [+] {ip} (Source: {src})")
-
-                if removed:
-                    logger.info("--- IPs Identifying for REMOVAL ---")
-                    for ip in sorted(removed):
-                        logger.info(f" [-] {ip}")
-                
+                # Optional: Send NTFY on change
                 if ntfy_config and (added or removed):
-                    # Determine Dynamic Title based on action
-                    if added and removed:
-                        msg_title = "IPs Added & Removed"
-                    elif added:
-                        msg_title = "IPs Added"
-                    else:
-                        msg_title = "IPs Removed"
-
                     msg_lines = []
                     if added:
-                        msg_lines.append("Address Added:")
-                        for ip in sorted(added):
-                            src = source_map.get(ip, 'Unknown') if source_map else 'Unknown'
-                            msg_lines.append(f"+ {ip} ({src})")
+                        msg_lines.append(f"Added {len(added)} IPs")
                     if removed:
-                        if added: msg_lines.append("") # Spacer
-                        msg_lines.append("Address Removed:")
-                        for ip in sorted(removed):
-                            msg_lines.append(f"- {ip}")
-                    
-                    send_ntfy_msg(ntfy_config, "\n".join(msg_lines), title=msg_title)
+                        msg_lines.append(f"Removed {len(removed)} IPs")
+                    send_ntfy_msg(ntfy_config, ", ".join(msg_lines), title="IP Access List Updated")
 
             except Exception as check_e:
-                logger.warning(f"Could not verify existing IPs (Error: {check_e}), forcing update.")
+                logger.warning(f"Could not verify existing IPs ({check_e}), forcing update.")
 
-        # --- PREPARE PAYLOAD ---
-        clients = []
-        for ip in ips:
-            clients.append({
-                "address": ip,
-                "directive": "allow"
-            })
+        # Prepare Payload
+        clients = [{"address": ip, "directive": "allow"} for ip in ips]
             
         payload = {
             "name": name,
@@ -284,112 +291,111 @@ class NpmManager:
             "clients": clients
         }
 
-        logger.info(f"Preparing to send {len(clients)} IPs to NPM...")
-
         try:
             if list_id:
-                logger.info(f"Updating existing Access List ID: {list_id}")
-                logger.info("Sending update to NPM... this can take up to 60 seconds, please wait.")
+                logger.info(f"Updating Access List ID: {list_id} with {len(clients)} IPs...")
                 endpoint = f"{self.url}/api/nginx/access-lists/{list_id}"
                 resp = self.session.put(endpoint, headers=self.get_headers(), json=payload)
             else:
-                logger.info(f"Creating new Access List: {name}")
+                logger.info(f"Creating new Access List: {name} with {len(clients)} IPs...")
                 endpoint = f"{self.url}/api/nginx/access-lists"
                 resp = self.session.post(endpoint, headers=self.get_headers(), json=payload)
                 
             if resp.status_code in [200, 201]:
-                logger.info(f"SUCCESS: Updated Access List '{name}' with {len(ips)} IPs.")
+                logger.info(f"SUCCESS: Access List '{name}' updated.")
             else:
-                logger.error(f"Failed to update NPM. Status: {resp.status_code} Response: {resp.text}")
+                logger.error(f"Failed to update NPM. Status: {resp.status_code} Resp: {resp.text}")
                 
         except Exception as e:
              logger.error(f"Exception during update: {e}")
 
 def fetch_ips(ntfy_config=None):
-    """Download IPs and return a dictionary of {IP: Source_Name}."""
+    """Collects IPs from CSVs, Google, Manual config, AND Reverse DNS Scanning."""
     collected_ips = {} 
 
     # 1. Fetch CSV Sources
     for source_entry in ISP_SOURCES:
-        # Safe Unpacking
         if len(source_entry) == 4:
             name, url, filter_country, filter_region = source_entry
-        elif len(source_entry) == 3:
-            name, url, filter_country = source_entry
-            filter_region = None 
         else:
-            logger.warning(f"Skipping malformed source entry: {source_entry}")
-            continue
+            name, url, filter_country = source_entry[0], source_entry[1], source_entry[2]
+            filter_region = None 
 
-        logger.info(f"Processing {name}...")
-        
-        # Fetch with caching, fallback, and ntfy error alerts
+        logger.info(f"Processing Geofeed: {name}...")
         csv_text = get_content_with_fallback(name, url, ntfy_config)
         
-        if not csv_text:
-            continue 
+        if csv_text:
+            try:
+                reader = csv.reader(io.StringIO(csv_text))
+                count = 0
+                for row in reader:
+                    if len(row) < 3 or row[0].startswith('#'): continue
+                    
+                    ip, country, region = row[0].strip(), row[1].strip(), row[2].strip()
 
-        try:
-            f = io.StringIO(csv_text)
-            reader = csv.reader(f)
-            
-            count = 0
-            for row in reader:
-                if len(row) < 3: continue
-                if row[0].startswith('#'): continue
-
-                ip_prefix = row[0].strip()
-                country = row[1].strip()
-                region = row[2].strip()
-
-                if filter_country and country != filter_country: continue
-                if filter_region and region != filter_region: continue
-                
-                try:
-                    net = ipaddress.ip_network(ip_prefix, strict=False)
-                    collected_ips[str(net)] = name 
-                    count += 1
-                except ValueError:
-                    continue
-            
-            logger.info(f"  - Found {count} ranges for {name}")
-
-        except Exception as e:
-            logger.error(f"Error parsing CSV for {name}: {e}")
-
-    # 2. Fetch Google IPs (JSON)
-    logger.info("Processing Google IP Ranges...")
-    google_json_text = get_content_with_fallback("Google_Services", GOOGLE_IP_URL, ntfy_config)
-    
-    if google_json_text:
-        try:
-            data = json.loads(google_json_text)
-            
-            google_count = 0
-            prefixes = data.get('prefixes', [])
-            
-            for item in prefixes:
-                ip_prefix = item.get('ipv4Prefix') or item.get('ipv6Prefix')
-                if ip_prefix:
+                    if filter_country and country != filter_country: continue
+                    if filter_region and region != filter_region: continue
+                    
                     try:
-                        net = ipaddress.ip_network(ip_prefix, strict=False)
-                        collected_ips[str(net)] = "Google"
-                        google_count += 1
-                    except ValueError:
-                        continue
-            
-            logger.info(f"  - Added {google_count} Google IP ranges")
-        except json.JSONDecodeError as e:
-            logger.error(f"Error parsing Google JSON: {e}")
+                        net = ipaddress.ip_network(ip, strict=False)
+                        collected_ips[str(net)] = name 
+                        count += 1
+                    except ValueError: continue
+                logger.info(f"  -> Added {count} ranges")
+            except Exception as e:
+                logger.error(f"Error parsing CSV {name}: {e}")
 
-    # 3. Add Manual IPs
+    # 2. Scanner Logic (From test4.py)
+    if SEARCH_RULES:
+        logger.info("Processing ASN Scanner Rules...")
+        
+        # Organize rules by ASN
+        asn_map = {}
+        for asn, tag, pattern in SEARCH_RULES:
+            if asn not in asn_map: asn_map[asn] = []
+            asn_map[asn].append((tag, pattern))
+            
+        socket.setdefaulttimeout(SCANNER_TIMEOUT)
+        
+        for asn, rules in asn_map.items():
+            prefixes = fetch_ripe_data(asn, ntfy_config)
+            logger.info(f"  -> Scanning {asn} ({len(prefixes)} prefixes) with {len(rules)} rules...")
+            
+            found_count = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=SCANNER_THREADS) as executor:
+                future_to_cidr = {executor.submit(scan_cidr_for_hostname, cidr, rules): cidr for cidr in prefixes}
+                
+                for future in concurrent.futures.as_completed(future_to_cidr):
+                    result = future.result()
+                    if result:
+                        cidr, tag, host = result
+                        collected_ips[cidr] = tag
+                        found_count += 1
+                        # Optional: Log specific hits
+                        # logger.info(f"     [MATCH] {cidr} -> {tag} ({host})")
+            
+            logger.info(f"  -> Finished {asn}. Found {found_count} matching subnets.")
+
+    # 3. Google IPs
+    logger.info("Processing Google IP Ranges...")
+    google_json = get_content_with_fallback("Google_Services", GOOGLE_IP_URL, ntfy_config)
+    if google_json:
+        try:
+            data = json.loads(google_json)
+            count = 0
+            for item in data.get('prefixes', []):
+                ip = item.get('ipv4Prefix') or item.get('ipv6Prefix')
+                if ip:
+                    collected_ips[ip] = "Google"
+                    count += 1
+            logger.info(f"  -> Added {count} Google ranges")
+        except Exception as e:
+            logger.error(f"Error Google JSON: {e}")
+
+    # 4. Manual IPs
     logger.info("Processing Manual IP Ranges...")
     for ip in MANUAL_IP_RANGES:
-        try:
-            net = ipaddress.ip_network(ip.strip(), strict=False)
-            collected_ips[str(net)] = "Manual Config"
-        except ValueError as e:
-            logger.error(f"Invalid manual IP format '{ip}': {e}")
+        collected_ips[ip] = "Manual Config"
     
     return collected_ips
 
@@ -410,30 +416,21 @@ if __name__ == "__main__":
         NPM_PASS = config.get('npm_pass')
         
         if not all([NPM_URL, NPM_USER, NPM_PASS]):
-            logger.error("Error: Missing required NPM fields in config file.")
+            logger.error("Error: Missing required NPM fields in secrets file.")
             sys.exit(1)
 
-        if ENABLE_NTFY:
-            ntfy_url = config.get('ntfy_url')
-            ntfy_topic = config.get('ntfy_topic')
-            ntfy_token = config.get('ntfy_token') 
-            
-            if ntfy_url and ntfy_topic:
-                ntfy_settings = {
-                    'url': ntfy_url.rstrip('/'),
-                    'topic': ntfy_topic,
-                    'token': ntfy_token
-                }
-            else:
-                logger.warning("NTFY enabled but missing details in secrets.")
+        if ENABLE_NTFY and config.get('ntfy_url'):
+            ntfy_settings = {
+                'url': config.get('ntfy_url').rstrip('/'),
+                'topic': config.get('ntfy_topic'),
+                'token': config.get('ntfy_token')
+            }
 
     except Exception as e:
         logger.error(f"Configuration Error: {e}")
         sys.exit(1)
 
-    logger.info("Starting IP fetch process...")
-    
-    # Pass ntfy_settings to fetch_ips for error notifications
+    logger.info("Starting IP fetch and scan process...")
     ip_source_map = fetch_ips(ntfy_settings)
     
     if not ip_source_map:
