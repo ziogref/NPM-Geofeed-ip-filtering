@@ -38,6 +38,8 @@ ISP_SOURCES = [
     ("Leaptel.TAS", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU-TAS"),
     ("Flip Connect", "https://flipconnect.com.au/api/csv/flip-au-geo-feed-20240626.csv", "AU", "AU-VIC"),
     ("Leaptel.QLD", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU-QLD"),
+    ("Exetel", "https://lg.superloop.com/geofeed.txt", "AU", "AU-Unknown"),
+    ("Starlink", "https://geoip.starlinkisp.net/feed.csv", "AU", "AU-TAS"),
 ]
 
 # --- ASN Search ---
