@@ -28,7 +28,7 @@ ACCESS_LIST_NAME = "Allowed_ISPs"
 # Enable NTFY Notifications (True/False)
 ENABLE_NTFY = True
 
-# --- EXISTING GEOFEED SOURCES ---
+# --- GEOFEED SOURCES ---
 # Format: ("Name", "URL", "CountryCode", "RegionCode")
 ISP_SOURCES = [
     ("Launtel", "https://residential.launtel.net.au/geofeed.csv", "AU", "AU-TAS"),
@@ -40,7 +40,7 @@ ISP_SOURCES = [
     ("Leaptel.QLD", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU-QLD"),
 ]
 
-# --- NEW SCANNING RULES (From test4.py) ---
+# --- ASN Search ---
 # Format: ("ASN", "TAG_NAME", r"REGEX_PATTERN")
 # Note: These scan live Gateways. It may take time to run.
 SEARCH_RULES = [
@@ -61,8 +61,13 @@ GOOGLE_IP_URL = "https://www.gstatic.com/ipranges/goog.json"
 
 # Manual IP Ranges to always allow
 MANUAL_IP_RANGES = [
+    # CGNAT ipranges as users from on the same ISP come in via their CGNAT address
      "100.64.0.0/10",
+
+    # Internal LAN network
      "10.0.0.0/8",
+    
+    # Self Hosted VPN IP ranges
      "192.168.100.0/24",
      "192.168.167.0/24",
      "192.168.7.0/24",
@@ -148,7 +153,7 @@ def get_content_with_fallback(name, url, ntfy_config=None):
             return None
 
 # ==========================================
-# SCANNER LOGIC (From test4.py)
+# ASN Scanner
 # ==========================================
 
 def fetch_ripe_data(asn, ntfy_config=None):
