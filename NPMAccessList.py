@@ -53,6 +53,12 @@ SEARCH_RULES = [
     # --- AS7474 (Optus Wholesale/Business) ---
     ("AS7474", "OptusBiz.VIC_Mobile", r"pa\.vic|pa-vic"),
     ("AS7474", "OptusBiz.TAS_General", r"(\.|-)tas(\.|-)|hobart|launceston"),
+
+    # --- AS9500 (Vodafone NZ / One NZ) ---
+    ("AS9500", "VodafoneNZ", r"dyn\.cust\.vf\.net\.nz"),
+
+    # --- AS4771 (Spark NZ) ---
+    ("AS4771", "SparkNZ", r"adsl\.sparkbb\.co\.nz"),
 ]
 
 SCANNER_THREADS = 20   # Increased slightly for faster scanning
