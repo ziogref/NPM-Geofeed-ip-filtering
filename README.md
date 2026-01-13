@@ -1,5 +1,8 @@
 # NPM-Geofeed-ip-filtering
-gathering data from Geofeed files (RFC8805) for various Internet providers, applying regional filtering and adding those into Nginx Proxy Managers Allow list for access restriction. Script runs from any device that has Python that interacts with NPMs API.
+
+# Under Active Development 
+
+Gathering data from Geofeed files (RFC8805) for various Internet providers, applying regional filtering and adding those into Nginx Proxy Managers Allow list for access restriction. Script runs from any device that has Python that interacts with NPMs API.
 
 My configuration in Unraid.
 
