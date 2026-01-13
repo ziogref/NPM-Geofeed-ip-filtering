@@ -13,73 +13,15 @@ import socket
 import concurrent.futures
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION CONSTANTS
 # ==========================================
 
-# Path to your secrets file
-CONFIG_FILE = "/boot/config/npm_cache/npm_secrets.json" 
+# Base Directory
+BASE_DIR = "/boot/config/NPMAccessList"
 
-# Directory to store cached geofeed files (Persistent on Unraid)
-CACHE_DIR = "/boot/config/npm_cache"
-
-# Name of the Access List in NPM to create/update
-ACCESS_LIST_NAME = "Allowed_ISPs"
-
-# Enable NTFY Notifications (True/False)
-ENABLE_NTFY = True
-
-# --- GEOFEED SOURCES ---
-# Format: ("Name", "URL", "CountryCode", "RegionCode")
-ISP_SOURCES = [
-    ("Launtel", "https://residential.launtel.net.au/geofeed.csv", "AU", "AU-TAS"),
-    ("Telstra.TAS", "https://geofeed.tools.telstra.net/geofeed.csv", "AU", "AU-TAS"),
-    ("Telstra.VIC", "https://geofeed.tools.telstra.net/geofeed.csv", "AU", "AU-VIC"), 
-    ("AussieBroadBand", "https://speed.aussiebroadband.com.au/abb-geo.csv", "AU", "AU-VIC"),
-    ("Leaptel.TAS", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU-TAS"),
-    ("Flip Connect", "https://flipconnect.com.au/api/csv/flip-au-geo-feed-20240626.csv", "AU", "AU-VIC"),
-    ("Leaptel.QLD", "https://www.xi.com.au/geo/RFC8805.csv", "AU", "AU-QLD"),
-    ("Exetel", "https://lg.superloop.com/geofeed.txt", "AU", "AU-Unknown"),
-    ("Starlink", "https://geoip.starlinkisp.net/feed.csv", "AU", "AU-TAS"),
-]
-
-# --- ASN Search ---
-# Format: ("ASN", "TAG_NAME", r"REGEX_PATTERN")
-# Note: These scan live Gateways. It may take time to run.
-SEARCH_RULES = [
-    # --- AS4804 (Optus Retail/Backbone) ---
-    ("AS4804", "Optus.VIC_Mobile", r"pa\.vic|pa-vic"),
-    ("AS4804", "Optus.TAS_General", r"(\.|-)tas(\.|-)|hobart|launceston"),
-    
-    # --- AS7474 (Optus Wholesale/Business) ---
-    ("AS7474", "OptusBiz.VIC_Mobile", r"pa\.vic|pa-vic"),
-    ("AS7474", "OptusBiz.TAS_General", r"(\.|-)tas(\.|-)|hobart|launceston"),
-
-    # --- AS9500 (Vodafone NZ / One NZ) ---
-    ("AS9500", "VodafoneNZ", r"dyn\.cust\.vf\.net\.nz"),
-
-    # --- AS4771 (Spark NZ) ---
-    ("AS4771", "SparkNZ", r"adsl\.sparkbb\.co\.nz"),
-]
-
-SCANNER_THREADS = 20   # Increased slightly for faster scanning
-SCANNER_TIMEOUT = 2.0  # Timeout for DNS lookups
-
-# Google IP Ranges URL (JSON format)
-GOOGLE_IP_URL = "https://www.gstatic.com/ipranges/goog.json"
-
-# Manual IP Ranges to always allow
-MANUAL_IP_RANGES = [
-    # CGNAT ipranges as users from on the same ISP come in via their CGNAT address
-     "100.64.0.0/10",
-
-    # Internal LAN network
-     "10.0.0.0/8",
-    
-    # Self Hosted VPN IP ranges
-     "192.168.100.0/24",
-     "192.168.167.0/24",
-     "192.168.7.0/24",
-]
+# Sub-directories
+CONFIG_DIR = os.path.join(BASE_DIR, "Config")
+CACHE_DIR = os.path.join(BASE_DIR, "Cache")
 
 # Logging Configuration
 logging.basicConfig(
@@ -92,9 +34,25 @@ logger = logging.getLogger(__name__)
 # HELPERS
 # ==========================================
 
+def load_config(filename):
+    """Loads a JSON config file from the config directory."""
+    path = os.path.join(CONFIG_DIR, filename)
+    if not os.path.exists(path):
+        logger.warning(f"Config file not found: {path}")
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON in {filename}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading {filename}: {e}")
+        return None
+
 def send_ntfy_msg(ntfy_config, message, title):
     """Standalone function to send NTFY messages with Title and Tags."""
-    if not ntfy_config:
+    if not ntfy_config or not ntfy_config.get('enabled', False):
         return
 
     try:
@@ -146,7 +104,7 @@ def get_content_with_fallback(name, url, ntfy_config=None):
         elif "404" in raw_error: clean_error = "HTTP 404"
         elif "500" in raw_error: clean_error = "HTTP 500"
         
-        if ntfy_config:
+        if ntfy_config and ntfy_config.get('enabled', False):
             ntfy_msg = f"{name} | {clean_error} | Using last known data"
             send_ntfy_msg(ntfy_config, ntfy_msg, title="Download Failed")
 
@@ -167,7 +125,6 @@ def get_content_with_fallback(name, url, ntfy_config=None):
 def fetch_ripe_data(asn, ntfy_config=None):
     """Fetches prefixes for an ASN using RIPE API (With caching)."""
     url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource={asn}"
-    # We use the existing fallback downloader so we don't spam RIPE if they go down
     content = get_content_with_fallback(f"RIPE_{asn}", url, ntfy_config)
     
     if not content:
@@ -282,7 +239,7 @@ class NpmManager:
                 logger.info(f"CHANGES: {len(added)} to add, {len(removed)} to remove.")
 
                 # Optional: Send NTFY on change
-                if ntfy_config and (added or removed):
+                if ntfy_config and ntfy_config.get('enabled', False) and (added or removed):
                     msg_lines = []
                     if added:
                         msg_lines.append(f"Added {len(added)} IPs")
@@ -323,92 +280,129 @@ class NpmManager:
              logger.error(f"Exception during update: {e}")
 
 def fetch_ips(ntfy_config=None):
-    """Collects IPs from CSVs, Google, Manual config, AND Reverse DNS Scanning."""
+    """Collects IPs from all configured sources."""
     collected_ips = {} 
 
-    # 1. Fetch CSV Sources
-    for source_entry in ISP_SOURCES:
-        if len(source_entry) == 4:
-            name, url, filter_country, filter_region = source_entry
-        else:
-            name, url, filter_country = source_entry[0], source_entry[1], source_entry[2]
-            filter_region = None 
+    # 1. Geofeed Sources
+    geofeed_config = load_config("Geofeed.config")
+    if geofeed_config and geofeed_config.get('enabled', False):
+        sources = geofeed_config.get('isp_sources', [])
+        for source_entry in sources:
+            # Handle both list and tuple formats from JSON (JSON uses lists)
+            if len(source_entry) >= 4:
+                name, url, filter_country, filter_region = source_entry[:4]
+            elif len(source_entry) == 3:
+                name, url, filter_country = source_entry[:3]
+                filter_region = None
+            else:
+                logger.warning(f"Invalid Geofeed entry: {source_entry}")
+                continue
 
-        logger.info(f"Processing Geofeed: {name}...")
-        csv_text = get_content_with_fallback(name, url, ntfy_config)
-        
-        if csv_text:
-            try:
-                reader = csv.reader(io.StringIO(csv_text))
-                count = 0
-                for row in reader:
-                    if len(row) < 3 or row[0].startswith('#'): continue
-                    
-                    ip, country, region = row[0].strip(), row[1].strip(), row[2].strip()
-
-                    if filter_country and country != filter_country: continue
-                    if filter_region and region != filter_region: continue
-                    
-                    try:
-                        net = ipaddress.ip_network(ip, strict=False)
-                        collected_ips[str(net)] = name 
-                        count += 1
-                    except ValueError: continue
-                logger.info(f"  -> Added {count} ranges")
-            except Exception as e:
-                logger.error(f"Error parsing CSV {name}: {e}")
-
-    # 2. Scanner Logic (From test4.py)
-    if SEARCH_RULES:
-        logger.info("Processing ASN Scanner Rules...")
-        
-        # Organize rules by ASN
-        asn_map = {}
-        for asn, tag, pattern in SEARCH_RULES:
-            if asn not in asn_map: asn_map[asn] = []
-            asn_map[asn].append((tag, pattern))
+            logger.info(f"Processing Geofeed: {name}...")
+            csv_text = get_content_with_fallback(name, url, ntfy_config)
             
-        socket.setdefaulttimeout(SCANNER_TIMEOUT)
+            if csv_text:
+                try:
+                    reader = csv.reader(io.StringIO(csv_text))
+                    count = 0
+                    for row in reader:
+                        if len(row) < 3 or row[0].startswith('#'): continue
+                        
+                        ip, country, region = row[0].strip(), row[1].strip(), row[2].strip()
+
+                        if filter_country and country != filter_country: continue
+                        if filter_region and region != filter_region: continue
+                        
+                        try:
+                            net = ipaddress.ip_network(ip, strict=False)
+                            collected_ips[str(net)] = name 
+                            count += 1
+                        except ValueError: continue
+                    logger.info(f"  -> Added {count} ranges")
+                except Exception as e:
+                    logger.error(f"Error parsing CSV {name}: {e}")
+
+    # 2. ASN Search Logic
+    search_config = load_config("ASNSearch.config")
+    if search_config and search_config.get('enabled', False):
+        search_rules = search_config.get('search_rules', [])
+        scanner_threads = search_config.get('scanner_threads', 20)
+        scanner_timeout = search_config.get('scanner_timeout', 2.0)
         
-        for asn, rules in asn_map.items():
-            prefixes = fetch_ripe_data(asn, ntfy_config)
-            logger.info(f"  -> Scanning {asn} ({len(prefixes)} prefixes) with {len(rules)} rules...")
+        if search_rules:
+            logger.info("Processing ASN Scanner Rules...")
             
-            found_count = 0
-            with concurrent.futures.ThreadPoolExecutor(max_workers=SCANNER_THREADS) as executor:
-                future_to_cidr = {executor.submit(scan_cidr_for_hostname, cidr, rules): cidr for cidr in prefixes}
+            # Organize rules by ASN
+            asn_map = {}
+            for rule in search_rules:
+                if len(rule) < 3: continue
+                asn, tag, pattern = rule
+                if asn not in asn_map: asn_map[asn] = []
+                asn_map[asn].append((tag, pattern))
                 
-                for future in concurrent.futures.as_completed(future_to_cidr):
-                    result = future.result()
-                    if result:
-                        cidr, tag, host = result
-                        collected_ips[cidr] = tag
-                        found_count += 1
-                        # Optional: Log specific hits
-                        # logger.info(f"     [MATCH] {cidr} -> {tag} ({host})")
+            socket.setdefaulttimeout(scanner_timeout)
             
-            logger.info(f"  -> Finished {asn}. Found {found_count} matching subnets.")
+            for asn, rules in asn_map.items():
+                prefixes = fetch_ripe_data(asn, ntfy_config)
+                logger.info(f"  -> Scanning {asn} ({len(prefixes)} prefixes) with {len(rules)} rules...")
+                
+                found_count = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=scanner_threads) as executor:
+                    future_to_cidr = {executor.submit(scan_cidr_for_hostname, cidr, rules): cidr for cidr in prefixes}
+                    
+                    for future in concurrent.futures.as_completed(future_to_cidr):
+                        result = future.result()
+                        if result:
+                            cidr, tag, host = result
+                            collected_ips[cidr] = tag
+                            found_count += 1
+                
+                logger.info(f"  -> Finished {asn}. Found {found_count} matching subnets.")
 
-    # 3. Google IPs
-    logger.info("Processing Google IP Ranges...")
-    google_json = get_content_with_fallback("Google_Services", GOOGLE_IP_URL, ntfy_config)
-    if google_json:
-        try:
-            data = json.loads(google_json)
-            count = 0
-            for item in data.get('prefixes', []):
-                ip = item.get('ipv4Prefix') or item.get('ipv6Prefix')
-                if ip:
-                    collected_ips[ip] = "Google"
-                    count += 1
-            logger.info(f"  -> Added {count} Google ranges")
-        except Exception as e:
-            logger.error(f"Error Google JSON: {e}")
+    # 3. JSON Files (e.g., Google)
+    json_files_config = load_config("jsonFiles.config")
+    if json_files_config and json_files_config.get('enabled', False):
+        logger.info("Processing JSON Sources...")
+        json_items = json_files_config.get('items', [])
+        
+        for item in json_items:
+            name = item.get('name', 'Unknown JSON')
+            url = item.get('url')
+            if not url: continue
+            
+            content = get_content_with_fallback(name, url, ntfy_config)
+            if content:
+                try:
+                    data = json.loads(content)
+                    count = 0
+                    
+                    # Logic for Google-style JSON (prefixes -> ipv4Prefix)
+                    if isinstance(data, dict) and 'prefixes' in data:
+                        for p in data.get('prefixes', []):
+                            ip = p.get('ipv4Prefix') or p.get('ipv6Prefix')
+                            if ip:
+                                collected_ips[ip] = name
+                                count += 1
+                                
+                    # Logic for simple IP list JSON (["1.2.3.4", "5.6.7.8"])
+                    elif isinstance(data, list):
+                        for ip in data:
+                            try:
+                                ipaddress.ip_network(ip, strict=False) # Validate
+                                collected_ips[ip] = name
+                                count += 1
+                            except ValueError: pass
+                            
+                    logger.info(f"  -> Added {count} ranges from {name}")
+                except Exception as e:
+                    logger.error(f"Error parsing JSON {name}: {e}")
 
-    # 4. Manual IPs
-    logger.info("Processing Manual IP Ranges...")
-    for ip in MANUAL_IP_RANGES:
-        collected_ips[ip] = "Manual Config"
+    # 4. Manual IP Ranges
+    manual_config = load_config("ManualIPRanges.config")
+    if manual_config and manual_config.get('enabled', False):
+        logger.info("Processing Manual IP Ranges...")
+        for ip in manual_config.get('manual_ip_ranges', []):
+            collected_ips[ip] = "Manual Config"
     
     return collected_ips
 
@@ -417,38 +411,35 @@ def fetch_ips(ntfy_config=None):
 # ==========================================
 
 if __name__ == "__main__":
-    ntfy_settings = None
-    
-    try:
-        logger.info(f"Loading configuration from {CONFIG_FILE}...")
-        with open(CONFIG_FILE, 'r') as f:
-            config = json.load(f)
-            
-        NPM_URL = config.get('npm_url')
-        NPM_USER = config.get('npm_user')
-        NPM_PASS = config.get('npm_pass')
-        
-        if not all([NPM_URL, NPM_USER, NPM_PASS]):
-            logger.error("Error: Missing required NPM fields in secrets file.")
-            sys.exit(1)
-
-        if ENABLE_NTFY and config.get('ntfy_url'):
-            ntfy_settings = {
-                'url': config.get('ntfy_url').rstrip('/'),
-                'topic': config.get('ntfy_topic'),
-                'token': config.get('ntfy_token')
-            }
-
-    except Exception as e:
-        logger.error(f"Configuration Error: {e}")
+    if not os.path.exists(CONFIG_DIR):
+        logger.error(f"Config directory not found: {CONFIG_DIR}")
+        logger.info("Please create the directory and populate the .config files.")
         sys.exit(1)
 
+    # Load Mandatory NPM Config
+    npm_config = load_config("NPM.config")
+    if not npm_config:
+        logger.error("Failed to load NPM.config. Exiting.")
+        sys.exit(1)
+        
+    NPM_URL = npm_config.get('npm_url')
+    NPM_USER = npm_config.get('npm_user')
+    NPM_PASS = npm_config.get('npm_pass')
+    ACCESS_LIST_NAME = npm_config.get('access_list_name', "Allowed_ISPs")
+
+    if not all([NPM_URL, NPM_USER, NPM_PASS]):
+        logger.error("Error: Missing required NPM fields in NPM.config")
+        sys.exit(1)
+
+    # Load Optional NTFY Config
+    ntfy_config = load_config("NTFY.config")
+    
     logger.info("Starting IP fetch and scan process...")
-    ip_source_map = fetch_ips(ntfy_settings)
+    ip_source_map = fetch_ips(ntfy_config)
     
     if not ip_source_map:
         logger.warning("No IPs found! Aborting update.")
-        exit()
+        sys.exit(0)
         
     unique_ips_list = list(ip_source_map.keys())
     logger.info(f"Total unique IP ranges to import: {len(unique_ips_list)}")
@@ -456,6 +447,6 @@ if __name__ == "__main__":
     try:
         npm = NpmManager(NPM_URL, NPM_USER, NPM_PASS)
         npm.login()
-        npm.update_access_list(ACCESS_LIST_NAME, unique_ips_list, source_map=ip_source_map, ntfy_config=ntfy_settings)
+        npm.update_access_list(ACCESS_LIST_NAME, unique_ips_list, source_map=ip_source_map, ntfy_config=ntfy_config)
     except Exception as e:
         logger.error(f"Script failed: {e}")
