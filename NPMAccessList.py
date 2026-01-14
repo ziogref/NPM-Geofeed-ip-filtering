@@ -371,7 +371,7 @@ def fetch_ips(ntfy_config=None):
     """Collects IPs from all configured sources."""
     collected_ips = {} 
 
-    # 1. Geofeed Sources
+    # 1. Geofeed Sources (Fixed: Separate Aggregation)
     geofeed_config = load_config("Geofeed.config")
     if geofeed_config and geofeed_config.get('enabled', False):
         ipv4_on = geofeed_config.get('ipv4', True)
@@ -391,31 +391,53 @@ def fetch_ips(ntfy_config=None):
             csv_text = get_content_with_fallback(name, url, ntfy_config)
             
             if csv_text:
-                count_v4 = 0
-                count_v6 = 0
+                # Separate lists for V4 and V6
+                raw_nets_v4 = []
+                raw_nets_v6 = []
+                
                 try:
                     reader = csv.reader(io.StringIO(csv_text))
                     for row in reader:
                         if len(row) < 3 or row[0].startswith('#'): continue
                         ip, country, region = row[0].strip(), row[1].strip(), row[2].strip()
+                        
                         if filter_country and country != filter_country: continue
                         if filter_region and region != filter_region: continue
                         
                         try:
                             net = ipaddress.ip_network(ip, strict=False)
-                            if is_ip_version_enabled(net, ipv4_on, ipv6_on):
-                                collected_ips[str(net)] = name 
-                                if net.version == 4: count_v4 += 1
-                                else: count_v6 += 1
+                            # Check config enablement and split into correct list
+                            if net.version == 4 and ipv4_on:
+                                raw_nets_v4.append(net)
+                            elif net.version == 6 and ipv6_on:
+                                raw_nets_v6.append(net)
                         except ValueError: continue
                     
-                    if count_v4 > 0: logger.info(f"  -> Added {count_v4} IPv4 Ranges")
-                    if count_v6 > 0: logger.info(f"  -> Added {count_v6} IPv6 Ranges")
+                    # --- Aggregation Logic (Split by Version) ---
+                    count_v4 = 0
+                    count_v6 = 0
+                    
+                    if raw_nets_v4:
+                        collapsed_v4 = list(ipaddress.collapse_addresses(raw_nets_v4))
+                        count_v4 = len(collapsed_v4)
+                        for net in collapsed_v4:
+                            collected_ips[str(net)] = name
+
+                    if raw_nets_v6:
+                        collapsed_v6 = list(ipaddress.collapse_addresses(raw_nets_v6))
+                        count_v6 = len(collapsed_v6)
+                        for net in collapsed_v6:
+                            collected_ips[str(net)] = name
+                    
+                    if count_v4 > 0 or count_v6 > 0:
+                        logger.info(f"  -> Aggregated to {count_v4} IPv4 and {count_v6} IPv6 Supernets.")
+                    else:
+                        logger.warning(f"  -> No valid IPs found in {name} matching filters.")
                     
                 except Exception as e:
                     logger.error(f"Error parsing CSV {name}: {e}")
-
-    # 2. ASN Search Logic
+                    
+    # 2. ASN Search Logic (IPv6 & IPv4 Aggregation)
     search_config = load_config("ASNSearch.config")
     if search_config and search_config.get('enabled', False):
         ipv4_on = search_config.get('ipv4', True)
@@ -426,7 +448,6 @@ def fetch_ips(ntfy_config=None):
         
         if search_rules:
             logger.info(f"Processing ASN Scanner Rules (IPv4={ipv4_on}, IPv6={ipv6_on})...")
-            logger.info("NOTE: This process scans live gateways and may take some time depending on the number of prefixes. Please be patient.")
             
             asn_map = {}
             for rule in search_rules:
@@ -439,26 +460,72 @@ def fetch_ips(ntfy_config=None):
             
             for asn, rules in asn_map.items():
                 prefixes = fetch_ripe_data(asn, ntfy_config, ipv4_enabled=ipv4_on, ipv6_enabled=ipv6_on)
-                logger.info(f"  -> Scanning {asn} ({len(prefixes)} prefixes)...")
                 
-                found_v4 = 0
-                found_v6 = 0
+                v4_prefixes = []
+                v6_prefixes = []
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=scanner_threads) as executor:
-                    future_to_cidr = {executor.submit(scan_cidr_for_hostname, cidr, rules): cidr for cidr in prefixes}
-                    for future in concurrent.futures.as_completed(future_to_cidr):
-                        result = future.result()
-                        if result:
-                            cidr, tag, host = result
-                            collected_ips[cidr] = tag
-                            try:
-                                net = ipaddress.ip_network(cidr, strict=False)
-                                if net.version == 4: found_v4 += 1
-                                else: found_v6 += 1
-                            except ValueError: pass
-                
-                if found_v4 > 0: logger.info(f"  -> Finished {asn}. Found {found_v4} IPv4 subnets.")
-                if found_v6 > 0: logger.info(f"  -> Finished {asn}. Found {found_v6} IPv6 subnets.")
+                for p in prefixes:
+                    try:
+                        net = ipaddress.ip_network(p, strict=False)
+                        if net.version == 4:
+                            v4_prefixes.append(p)
+                        elif net.version == 6:
+                            v6_prefixes.append(p)
+                    except ValueError:
+                        continue
+
+                # --- IPv6 LOGIC (No Scan + Aggregation) ---
+                if v6_prefixes and ipv6_on:
+                    default_tag = rules[0][0] if rules else f"{asn}_IPv6"
+                    net_objects = []
+                    for p in v6_prefixes:
+                        try:
+                            net_objects.append(ipaddress.ip_network(p, strict=False))
+                        except ValueError: pass
+                    
+                    collapsed_nets = list(ipaddress.collapse_addresses(net_objects))
+                    
+                    logger.warning(f"  -> {asn} (IPv6): Filtering disabled. Aggregating...")
+                    logger.info(f"     Merged {len(net_objects)} raw prefixes into {len(collapsed_nets)} supernets.")
+                    
+                    for net in collapsed_nets:
+                        collected_ips[str(net)] = default_tag
+
+                # --- IPv4 LOGIC (Scan + Aggregation) ---
+                if v4_prefixes and ipv4_on:
+                    logger.info(f"  -> {asn} (IPv4): Scanning {len(v4_prefixes)} prefixes...")
+                    
+                    # Temp storage to group hits by their Tag (so we don't merge "Mobile" with "Home")
+                    hits_by_tag = {} # { "Tagname": [net_obj1, net_obj2] }
+                    
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=scanner_threads) as executor:
+                        future_to_cidr = {executor.submit(scan_cidr_for_hostname, cidr, rules): cidr for cidr in v4_prefixes}
+                        for future in concurrent.futures.as_completed(future_to_cidr):
+                            result = future.result()
+                            if result:
+                                cidr, tag, host = result
+                                
+                                if tag not in hits_by_tag:
+                                    hits_by_tag[tag] = []
+                                
+                                try:
+                                    hits_by_tag[tag].append(ipaddress.ip_network(cidr, strict=False))
+                                except ValueError: pass
+
+                    # Now Aggregate per Tag
+                    total_v4_collapsed = 0
+                    for tag, net_objects in hits_by_tag.items():
+                        if not net_objects: continue
+                        
+                        collapsed = list(ipaddress.collapse_addresses(net_objects))
+                        total_v4_collapsed += len(collapsed)
+                        
+                        logger.info(f"     [{tag}] Found {len(net_objects)} subnets -> Aggregated to {len(collapsed)}.")
+                        
+                        for net in collapsed:
+                            collected_ips[str(net)] = tag
+
+                    logger.info(f"  -> Finished {asn}. Total IPv4 ranges added: {total_v4_collapsed}")
     
     # 3. JSON Files
     json_files_config = load_config("jsonFiles.config")
@@ -479,8 +546,6 @@ def fetch_ips(ntfy_config=None):
             if content:
                 try:
                     data = json.loads(content)
-                    
-                    # Google Style (keys: ipv4Prefix, ipv6Prefix)
                     if isinstance(data, dict) and 'prefixes' in data:
                         for p in data.get('prefixes', []):
                             if ipv4_on and 'ipv4Prefix' in p:
@@ -489,8 +554,6 @@ def fetch_ips(ntfy_config=None):
                             if ipv6_on and 'ipv6Prefix' in p:
                                 collected_ips[p['ipv6Prefix']] = name
                                 count_v6 += 1
-                                
-                    # Flat List Style (list of strings)
                     elif isinstance(data, list):
                         for ip in data:
                             try:
